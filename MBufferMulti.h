@@ -27,10 +27,12 @@ template<size_t TRows, size_t TColumns, typename T>
 class MBuffer {
 public:
 	//! raw buffer size
-	static const size_t m_rawBufSize = TRows*TColumns;
-	typedef T ValueType;
+	enum	{ m_rawBufSize = TRows*TColumns};
+	//! message obj type
+	typedef T ValueType; 
 private:
-	//! number of rows; invariant m_rows x m_columns = m_rawBufSize	
+	//! number of rows; invariant m_rows x m_columns = m_rawBufSize
+	
 	//! Number of rows also constitues ring buffer size. The synchronization
 	// is done for an entire row.
 	size_t    m_rows;
@@ -54,32 +56,28 @@ private:
 	    READY_FOR_READ:	available to read
 	    READING:			being read
 	*/
-	enum class	Status: long {READY_FOR_WRITE = 0, WRITING=1, READY_FOR_READ=2, 
-		                      READING=3};
+	enum class	Status: long {READY_FOR_WRITE = 0, WRITING=1,
+		READY_FOR_READ=2, 
+		READING=3,
+		READY_FOR_READ_2=4, // ready for 2nd consumer
+		READING_2=5 // 2nd cons reading
+	};
 	//! buffer to store per location status.
 
 	//! strictly speaking the array need be no greater than m_rows,
-	// but unless we do dynamic allocation when m_rows, m_columns change
-	// we stick to static m_rows x m_columns size.
+	// but unless we do dynamic allocation, we stick to static m_rows x m_columns size.
 	std::atomic<Status>	m_locStatus[m_rawBufSize];
-
 	//! Ring buffer location to abs location map.
 
 	// This is a ring buffer.
-	// A 'location' corresponds to an entire row of m_columns.
+	// A 'location' corresponds to an entire row.
 	// So, a location x can refer to x, x + m_rows, x + 2*m_rows..and so on.
 	// A ring buffer location can be associated with only one absolute location
-	// at any point.
-	// For example, consider ring buffer of 5 (locations 0,1,2,3,4)
-	// absolute location, ever increasing  0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 ...
-	// ring buffer loc wraps around        0 1 2 3 4 <-- mapped to 5 abs values starting at 0
-	//                                               0 1 2 3 4 mapped to 5 abs values starting at 5
-	//
-	//
-	// Once elements in ring buffer row x which is mapped to x + m_rows are produced and consumed,
+	// from the point it is produced, until it is consumed.
+	// Once elements in x which is mapped to in x + m_rows are produced and consumed,
 	// the same x is mapped to x + 2*m_rows for subsequent use by producer.
 	// Thus the mapping is to chronologically increasing values.
-
+	// This map is to establish what is expected at any particular point.
 	// When a producer or consumer is processing a ring buffer location, 
 	// its corresponding  map location should not change.
 	// Otherwise a producer and a consumer can see different values in the same
@@ -87,8 +85,8 @@ private:
 	// This map is written to by a producer:
 	// For eg. a producer writes a value in ring buffer x and specifies in the map
 	// what absoute location that the value is for.
-	// It is consumer responsibility (via GetNextLocForCons) to ensure that
-	// the buf loc it is seeking to consume refers to the same absolute
+	// It is GetNextLocForCons responsibility to ensure that
+	// the buf loc they are seeking to consume refers to the same absolute
 	// location producer wrote, and did not change absolute location
 	// by the time they return the location to the caller. This map is used for that.
 	// Strictly speaking the array need be no greater than m_rows,
@@ -151,17 +149,16 @@ public:
 		// and then set status to WRITING.
 		// When status is WRITING, no other producer can write, 
 		// and no consumer can read.
-		auto absLoc = m_prodLoc.load();
-		auto loc = absLoc % m_rows;
+		long absLoc = m_prodLoc.load();
+		size_t loc = absLoc % m_rows;
 		std::atomic<Status>* status{ &m_locStatus[loc] };
-		auto statusReadyForWrite = Status::READY_FOR_WRITE;
-		auto statusWriting = Status::WRITING;
+		Status statusReadyForWrite = Status::READY_FOR_WRITE;
+		Status statusWriting = Status::WRITING;
 		while ( (!status->compare_exchange_strong (statusReadyForWrite, statusWriting))
 			&& (!m_stop) )
 		{
 			std::this_thread::sleep_for(std::chrono::microseconds(1)); 
-			// restore statusReadyForWrite as this can be overwritten
-			// by compare_exchange_strong
+			// restore statusReadyForWrite as this is overwritten
 			statusReadyForWrite = Status::READY_FOR_WRITE;
 			// update status in case m_prodLoc is changed by another 
 			// thread meanwhile
@@ -183,7 +180,7 @@ public:
 
 	//! get next free loc in m_buf to consume.
 	/*!
-	This is m_consLoc: one past the last consumed absolute location.
+	This is m_consLoc: one past the last consumed location.
 	a  loc will give access to m_columns elements to read which
 	need not be synchronised.
 	A consumer can read from a loc only if status is READY_FOR_READ.
@@ -195,52 +192,57 @@ public:
 	infinite.
 
 	\param  [out]   absLoc_  next absolute location for the consumer
+	\param  [in]    Status to wait for
 	\return         ring buffer location = absLoc_ % m_rows.
 	                size_t(-1), illegal value, returned when buffer is stopped.
 	*/
-	size_t	GetNextLocForCons(size_t& absLoc_)
+	size_t	GetNextLocWithStatus(size_t& absLoc_, Status statusToWaitFor_ = Status::READY_FOR_READ,
+		Status statusToSet_ = Status::READING)
 	{
-		// wait as long as m_consLoc status is not READY_FOR_READ;
-		// and then set status to READING.
-		// When status is READING, no producer can write, and no other consumer can read.
-		auto absLoc = m_consLoc.load();
-		auto loc = absLoc % m_rows;
+		// wait as long as m_consLoc status is not statusToWaitFor;
+		// and then set status to statusToSet.
+		// When status is statusToSet, no producer can write, and no other consumer can read.
+		long absLoc = m_consLoc.load();
+		size_t loc = absLoc % m_rows;
 		std::atomic<Status>* status{ &m_locStatus[loc] };
-		auto statusReadyForRead = Status::READY_FOR_READ;
-		auto statusReading = Status::READING;
+		Status statusToWaitFor = statusToWaitFor_;
+		Status statusReading = statusToSet_;
 		while (!m_stop)
 		{
-			while ((!status->compare_exchange_strong(statusReadyForRead, statusReading))
+			while ((!status->compare_exchange_strong(statusToWaitFor, statusReading))
 				&& (!m_stop))
 				// ------- (1)
 			{
 				std::this_thread::sleep_for(std::chrono::microseconds(1)); 
 				// restore statusReadyForRead as this is overwritten
-				statusReadyForRead = Status::READY_FOR_READ;
+				statusToWaitFor = statusToWaitFor_;
 				// update status in case m_consLoc is changed by 
 				// another thread meanwhile
 				absLoc = m_consLoc.load(); // ------------- (2)
 				loc = absLoc % m_rows;
 				status = &m_locStatus[loc];
 				// --------- (3)
-				// In the sequence(2)--> (3)--- next iteration --->  (1) following may happen:
+				// In the sequence(2)--> (3)--- next iteration --->  (1) this may happen:
 				// Let this thread be A, another thread, say B, would be executing 
 				// the same code at (1).
 				// Thus, A and B are competing for the same m_consLoc.
 				// Let B wins and gets access to m_consLoc, sets status to READING
-				// comes out of loop, reaches (5), and returns. Afer it is consumed, its
-				// status is set to READY_FOR_WRITE for a producer to pick up.
-				// Let a producer thread C, meanwhile puts a value in this location
-				// and sets status to READY_FOR_READ.
-				// Note that when the producer writes here, it will be equivalent to
-				// absolute location m_consLoc + m_rows.
-				// m_consLoc  and m_consLoc + m_rows are mapped to the same ring buffer loc.
-				// m_consLoc % m_rows =  (m_consLoc + m_roww) % m_rows
-
+				// comes out of loop, reaches (5), consumes it and 
+				// sets status to READY_FOR_WRITE for a producer to pick up.
+				// Let A is still waiting at (1) on  m_consLoc. Eventually
+				// it will update at (2) after B  has modified m_consLoc at (5),
+				// but for now it is still at (1), waiting for that m_consLoc to 
+				// become statusToWaitFor, even though B has consumed, but A is unaware.
+				// Note that  m_consLoc is mapped to from: 
+				// m_consLoc % m_rows -> m_consLoc
+				// Another producer thread C, writes a new values upto and
+				// including m_consLoc + m_rows. This means new mapping.
+				// m_consLoc % m_rows -> m_consLoc + m_rows.
+				// Producer or another consumer sets it status  statusToWaitFor.
 				// A then finally gets this loc and reads value from here.
 				// The problem here is, A consumed a value which was the latest produced
 				// by producer, and not the previous value (m_rows back) it expected to read.
-				// The original value in that loc was overwritten by producer
+				// The original value in that loc was overwritten by producer 
 				// after B read it. This happens because we use ring buffer.
 				// A location x in ring buffer can refer to all absolute values
 				// x + m_rows, x + 2*m_rows, ..x + n*m_rows.
@@ -248,18 +250,16 @@ public:
 				// at x + m_rows might overwrite ring buffer status.
 				// Thus a consumer reading at absolute loc x + n*m_rows should get
 				// value written by producer at x + n*m_rows only. This
-				// sanity check is done at (4) using the
-				// ring buffer location to absolute location map.
+				// sanity check is done at (4).
 			}
 			// check if loc has same absLoc mapping and no producer changed it meanwhile.
 			if (m_locToAbsLocMap[loc].load() == absLoc) // ------ (4)
 				break;
 			// the absLoc has changed by producer. This consumer is interested 
-			// in the old value which no longer exists as it was consumed allready.
-			// release from READING to READY_FOR_READ so that a consumer thread (this or
-			// another thread)
+			// in the old absLoc which no longer exists as it was consumed already by some other cons thread.
+			// release from READING to statusToWaitFor so that another consumer
 			// that wants to read from new abs loc can take it.
-			status->store(statusReadyForRead); 
+			status->store(statusToWaitFor);
 		}
 		absLoc_ = absLoc;
 		if (m_stop) return (size_t)(-1); // when stopped, return val is invalid for caller
@@ -268,6 +268,10 @@ public:
 		m_consLoc.store(absLoc); //-------------- (5)
 
 		return loc; // all elements at this loc can be read lock-free
+	}
+	size_t	GetNextLocForCons(size_t& absLoc_)
+	{
+		return GetNextLocWithStatus(absLoc_, Status::READY_FOR_READ, Status::READING);
 	}
 
 	//! set given loc ready to consume.
@@ -278,7 +282,7 @@ public:
 	*/
 	void	SetLocReadyForCons(size_t absloc_)
 	{
-		const auto loc = absloc_ % m_rows;
+		size_t loc = absloc_ % m_rows;
 		std::atomic<Status>& status{ m_locStatus[loc] };
 		status.store(Status::READY_FOR_READ);
 	}
@@ -290,7 +294,7 @@ public:
 	*/
 	void	SetLocReadyForProd(size_t absloc_)
 	{
-		const auto  loc = absloc_ % m_rows;
+		size_t loc = absloc_ % m_rows;
 		std::atomic<Status>& status{ m_locStatus[loc] };
 		status.store(Status::READY_FOR_WRITE);
 	}
@@ -303,7 +307,7 @@ public:
 	void ReleaseAllLocks()
 	{
 		// release all locations
-		for (auto i = 0u; i < m_rows; ++i) {
+		for (size_t i = 0; i < m_rows; ++i) {
 			std::atomic<Status>& status{ m_locStatus[i] };
 			status.store(Status::READY_FOR_WRITE);
 			m_locToAbsLocMap[i].store(-1); // loc -> abs location is not set to start woth
@@ -340,8 +344,11 @@ public:
 	T* operator[](size_t loc_)  { return &m_buf[loc_*m_columns]; }
 	//! Return number of buffers.
 	size_t	BufSize() const { return m_rows; }
-	//! Return number of elements in a buffer.
+	//! (dprecate this and use NumColumns)
+	// Return number of elements in a buffer.
 	size_t	BufElemSize() const { return m_columns; }
+	//! Return number of columns in a buffer row.
+	size_t	NumColumns() const { return m_columns; }
 };
 
 
